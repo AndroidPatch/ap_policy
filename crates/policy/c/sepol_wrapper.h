@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+// libsepol internal functions we need
+extern int policydb_index_decls(sepol_handle_t *handle, policydb_t *p);
+extern int type_set_expand(type_set_t *set, ebitmap_t *t, policydb_t *p, unsigned char alwaysexpand);
+
 // Policy loading/saving (use different names to avoid conflicts with libsepol)
 policydb_t *sepol_db_new(void);
 void sepol_db_free(policydb_t *db);

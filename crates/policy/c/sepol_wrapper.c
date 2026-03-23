@@ -441,13 +441,17 @@ int sepol_add_genfscon(policydb_t *db, const char *fs, const char *path, const c
     return -1; // TODO
 }
 
-// Add type
+// Add type (based on Magisk's implementation)
 int sepol_add_type(policydb_t *db, const char *name, uint32_t flavor) {
     if (!db || !name) return -1;
 
-    if (find_type(db, name)) return 0; // Already exists
+    type_datum_t *type = hashtab_search(db->p_types.table, (hashtab_key_t)name);
+    if (type) {
+        // Type already exists - this is not an error
+        return 0;
+    }
 
-    type_datum_t *type = calloc(1, sizeof(type_datum_t));
+    type = calloc(1, sizeof(type_datum_t));
     if (!type) return -1;
 
     type_datum_init(type);
@@ -462,9 +466,30 @@ int sepol_add_type(policydb_t *db, const char *name, uint32_t flavor) {
         free(type);
         return -1;
     }
-
     type->s.value = value;
     ebitmap_set_bit(&db->global->branch_list->declared.p_types_scope, value - 1, 1);
+
+    // Resize type_attr_map and attr_type_map
+    size_t new_size = sizeof(ebitmap_t) * db->p_types.nprim;
+    db->type_attr_map = realloc(db->type_attr_map, new_size);
+    db->attr_type_map = realloc(db->attr_type_map, new_size);
+    ebitmap_init(&db->type_attr_map[value - 1]);
+    ebitmap_init(&db->attr_type_map[value - 1]);
+    ebitmap_set_bit(&db->type_attr_map[value - 1], value - 1, 1);
+
+    // Re-index the policy database (critical for proper serialization)
+    if (policydb_index_decls(NULL, db) != 0 ||
+        policydb_index_classes(db) != 0 ||
+        policydb_index_others(NULL, db, 0) != 0) {
+        return -1;
+    }
+
+    // Add the type to all roles
+    for (uint32_t i = 0; i < db->p_roles.nprim; i++) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types.negset, value - 1, 0);
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types.types, value - 1, 1);
+        type_set_expand(&db->role_val_to_struct[i]->types, &db->role_val_to_struct[i]->cache, db, 0);
+    }
 
     return 0;
 }

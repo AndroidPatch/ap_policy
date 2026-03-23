@@ -3,7 +3,7 @@
 
 # Cargo lock file for libraries (should be committed for binaries)
 # Cargo.lock
-
+.claude
 # IDE and editor files
 .idea/
 .vscode/

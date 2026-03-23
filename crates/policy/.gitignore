@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.so
+*.lib

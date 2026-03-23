@@ -1,0 +1,9 @@
+# Build artifacts
+/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,16 @@
+[package]
+name = "magiskpolicy"
+version.workspace = true
+edition.workspace = true
+description = "MagiskPolicy - SELinux Policy Patch Tool"
+license = "Apache-2.0"
+
+[[bin]]
+name = "magiskpolicy"
+path = "src/main.rs"
+
+[dependencies]
+policy = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(android)'] }

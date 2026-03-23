@@ -1,0 +1,63 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock file for libraries (should be committed for binaries)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Backup files
+*.bak
+*.orig
+*.backup
+
+# Log files
+*.log
+
+# Test artifacts
+/test-results/
+/coverage/
+
+# Documentation generated
+/doc/
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Native libraries
+*.so
+*.a
+*.o
+*.obj
+*.lib
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Profiling
+*.profraw
+*.profdata

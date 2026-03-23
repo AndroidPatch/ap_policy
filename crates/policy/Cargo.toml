@@ -1,0 +1,24 @@
+[package]
+name = "policy"
+version = "0.1.0"
+edition = "2021"
+description = "SELinux policy manipulation library"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+
+[build-dependencies]
+cc = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(android)', 'cfg(feature, values("sepol_linked", "sepol_stub"))'] }

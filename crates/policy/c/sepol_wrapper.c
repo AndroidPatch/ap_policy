@@ -50,24 +50,19 @@ static perm_datum_t *find_perm(class_datum_t *cls, const char *name) {
     return perm;
 }
 
-// Helper function to format context as string
+// Internal libsepol function — produces full "user:role:type[:mls]" string
+extern int context_to_string(sepol_handle_t *handle, const policydb_t *policydb,
+                             const context_struct_t *context,
+                             char **result, size_t *result_len);
+
+// Helper: format context as a heap-allocated string (caller must free)
 static char *context_to_str(policydb_t *db, context_struct_t *ctx) {
     if (!db || !ctx) return NULL;
-
-    const char *user = db->p_user_val_to_name[ctx->user - 1];
-    const char *role = db->p_role_val_to_name[ctx->role - 1];
-    const char *type = db->p_type_val_to_name[ctx->type - 1];
-
-    if (!user || !role || !type) return NULL;
-
-    // Simple context format: user:role:type
-    // TODO: Add MLS range if needed
-    size_t len = strlen(user) + strlen(role) + strlen(type) + 3;
-    char *str = malloc(len);
-    if (str) {
-        snprintf(str, len, "%s:%s:%s", user, role, type);
-    }
-    return str;
+    char *result = NULL;
+    size_t result_len = 0;
+    if (context_to_string(NULL, db, ctx, &result, &result_len) != 0)
+        return NULL;
+    return result;   // already NUL-terminated; caller frees
 }
 
 // Create a new policydb
@@ -796,16 +791,119 @@ int sepol_add_type_rule(policydb_t *db, const char *s, const char *t, const char
     return avtab_insert(&db->te_avtab, &key, &datum);
 }
 
-// Add filename trans (simplified)
+// Add filename_trans rule — mirrors Magisk's sepol_impl::add_filename_trans
 int sepol_add_filename_trans(policydb_t *db, const char *s, const char *t, const char *c, const char *d, const char *o) {
-    (void)db; (void)s; (void)t; (void)c; (void)d; (void)o;
-    return -1; // TODO
+    if (!db || !s || !t || !c || !d || !o) return -1;
+
+    type_datum_t *src = find_type(db, s);
+    if (!src) { fprintf(stderr, "filename_trans: source type %s does not exist\n", s); return -1; }
+    type_datum_t *tgt = find_type(db, t);
+    if (!tgt) { fprintf(stderr, "filename_trans: target type %s does not exist\n", t); return -1; }
+    class_datum_t *cls = find_class(db, c);
+    if (!cls) { fprintf(stderr, "filename_trans: class %s does not exist\n", c); return -1; }
+    type_datum_t *def = find_type(db, d);
+    if (!def) { fprintf(stderr, "filename_trans: default type %s does not exist\n", d); return -1; }
+
+    // Build lookup key (stack-allocated name, same as Magisk)
+    filename_trans_key_t key;
+    key.ttype  = tgt->s.value;
+    key.tclass = cls->s.value;
+    key.name   = (char *)o;   /* hashtab search doesn't mutate key */
+
+    // Walk existing chain for this key
+    filename_trans_datum_t *trans = (filename_trans_datum_t *)hashtab_search(db->filename_trans, (hashtab_key_t)&key);
+    filename_trans_datum_t *last  = NULL;
+    while (trans) {
+        if (ebitmap_get_bit(&trans->stypes, src->s.value - 1)) {
+            // Duplicate entry — just update the default type
+            trans->otype = def->s.value;
+            return 0;
+        }
+        if (trans->otype == def->s.value)
+            break;      // reuse this node (same otype, different stypes)
+        last  = trans;
+        trans = trans->next;
+    }
+
+    if (!trans) {
+        // New datum for this (key, otype) combination
+        trans = (filename_trans_datum_t *)calloc(1, sizeof(*trans));
+        if (!trans) return -1;
+        ebitmap_init(&trans->stypes);
+        trans->otype = def->s.value;
+    }
+
+    if (last) {
+        // Append to existing chain
+        last->next = trans;
+    } else {
+        // First entry for this key — allocate a permanent key and insert
+        filename_trans_key_t *new_key = (filename_trans_key_t *)malloc(sizeof(*new_key));
+        if (!new_key) { free(trans); return -1; }
+        new_key->ttype  = key.ttype;
+        new_key->tclass = key.tclass;
+        new_key->name   = strdup(o);
+        if (!new_key->name) { free(new_key); free(trans); return -1; }
+        if (hashtab_insert(db->filename_trans, (hashtab_key_t)new_key, trans) != 0) {
+            free(new_key->name); free(new_key); free(trans); return -1;
+        }
+    }
+
+    db->filename_trans_count++;
+    return ebitmap_set_bit(&trans->stypes, src->s.value - 1, 1) == 0 ? 0 : -1;
 }
 
-// Add genfscon (simplified)
+// context_from_string is an internal libsepol function
+extern int context_from_string(sepol_handle_t *handle, const policydb_t *policydb,
+                               context_struct_t **cptr,
+                               const char *con_str, size_t con_str_len);
+
+// Add genfscon rule — mirrors Magisk's sepol_impl::add_genfscon
 int sepol_add_genfscon(policydb_t *db, const char *fs, const char *path, const char *ctx) {
-    (void)db; (void)fs; (void)path; (void)ctx;
-    return -1; // TODO
+    if (!db || !fs || !path || !ctx) return -1;
+
+    // Parse context string into internal representation
+    context_struct_t *new_ctx = NULL;
+    if (context_from_string(NULL, db, &new_ctx, ctx, strlen(ctx)) != 0) {
+        fprintf(stderr, "genfscon: failed to parse context '%s'\n", ctx);
+        return -1;
+    }
+
+    // Find or create genfs node for this filesystem
+    genfs_t *genfs = db->genfs;
+    while (genfs) {
+        if (strcmp(genfs->fstype, fs) == 0) break;
+        genfs = genfs->next;
+    }
+    if (!genfs) {
+        genfs = (genfs_t *)calloc(1, sizeof(*genfs));
+        if (!genfs) { free(new_ctx); return -1; }
+        genfs->fstype = strdup(fs);
+        if (!genfs->fstype) { free(genfs); free(new_ctx); return -1; }
+        genfs->next = db->genfs;
+        db->genfs   = genfs;
+    }
+
+    // Find or create ocontext node for this path within the genfs
+    ocontext_t *ocon = genfs->head;
+    while (ocon) {
+        if (strcmp(ocon->u.name, path) == 0) break;
+        ocon = ocon->next;
+    }
+    if (!ocon) {
+        ocon = (ocontext_t *)calloc(1, sizeof(*ocon));
+        if (!ocon) { free(new_ctx); return -1; }
+        ocon->u.name = strdup(path);
+        if (!ocon->u.name) { free(ocon); free(new_ctx); return -1; }
+        ocon->next  = genfs->head;
+        genfs->head = ocon;
+    }
+
+    // Copy context in (overwrite if already set)
+    memset(ocon->context, 0, sizeof(ocon->context));
+    memcpy(&ocon->context[0], new_ctx, sizeof(*new_ctx));
+    free(new_ctx);
+    return 0;
 }
 
 // Add type (based on Magisk's implementation)

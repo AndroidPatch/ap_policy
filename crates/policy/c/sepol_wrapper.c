@@ -2,6 +2,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#if defined(__ANDROID__) || defined(__BSD__)
+// funopen declaration for Android/BSD
+FILE *funopen(void *cookie, int (*readfn)(void *, char *, int), int (*writefn)(void *, const char *, int), fpos_t (*seekfn)(void *, fpos_t, int), int (*closefn)(void *));
+#define HAVE_FUNOPEN 1
+#else
+#define HAVE_FUNOPEN 0
+#endif
 
 // Helper function to duplicate a string
 static char *dup_str(const char *s) {
@@ -119,12 +131,53 @@ policydb_t *sepol_db_from_data(const uint8_t *data, size_t len) {
     return db;
 }
 
+// Dynamic buffer for policy write
+struct policy_buf {
+    char *data;
+    size_t size;
+    size_t capacity;
+};
+
+#if HAVE_FUNOPEN
+static int buf_write(void *cookie, const char *buf, int len) {
+    struct policy_buf *pb = (struct policy_buf *)cookie;
+    size_t new_size = pb->size + len;
+    if (new_size > pb->capacity) {
+        size_t new_cap = pb->capacity ? pb->capacity * 2 : 64 * 1024;
+        while (new_cap < new_size) new_cap *= 2;
+        char *new_data = realloc(pb->data, new_cap);
+        if (!new_data) return -1;
+        pb->data = new_data;
+        pb->capacity = new_cap;
+    }
+    memcpy(pb->data + pb->size, buf, len);
+    pb->size = new_size;
+    return len;
+}
+#endif
+
 // Save policydb to file
+// Note: /sys/fs/selinux/load requires the entire policy to be written in one write() syscall
 int sepol_db_to_file(policydb_t *db, const char *path) {
     if (!db || !path) return -1;
 
-    FILE *fp = fopen(path, "wb");
+    char *data = NULL;
+    size_t size = 0;
+    FILE *fp = NULL;
+
+#if HAVE_FUNOPEN
+    // Use funopen (Android/BSD) to write to memory buffer
+    struct policy_buf pb = { .data = NULL, .size = 0, .capacity = 0 };
+    fp = funopen(&pb, NULL, buf_write, NULL, NULL);
     if (!fp) return -1;
+#else
+    // Use open_memstream (POSIX) for Linux
+    fp = open_memstream(&data, &size);
+    if (!fp) return -1;
+#endif
+
+    // Disable buffering since we're writing directly to memory
+    setbuf(fp, NULL);
 
     policy_file_t pf;
     policy_file_init(&pf);
@@ -133,7 +186,46 @@ int sepol_db_to_file(policydb_t *db, const char *path) {
 
     int ret = policydb_write(db, &pf);
     fclose(fp);
-    return ret;
+
+#if HAVE_FUNOPEN
+    data = pb.data;
+    size = pb.size;
+#endif
+
+    if (ret != 0) {
+        free(data);
+        return -1;
+    }
+
+    // Open file for writing
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        free(data);
+        return -1;
+    }
+
+    // Truncate if regular file and has content
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        (void)ftruncate(fd, 0);
+    }
+
+    // Write all data at once (required for /sys/fs/selinux/load)
+    size_t total = 0;
+    while (total < size) {
+        ssize_t written = write(fd, data + total, size - total);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            free(data);
+            return -1;
+        }
+        total += written;
+    }
+
+    close(fd);
+    free(data);
+    return 0;
 }
 
 // Print types (attributes or regular types)
@@ -467,17 +559,27 @@ int sepol_add_type(policydb_t *db, const char *name, uint32_t flavor) {
         return -1;
     }
     type->s.value = value;
-    ebitmap_set_bit(&db->global->branch_list->declared.p_types_scope, value - 1, 1);
+
+    // For modular policies, set scope; kernel policies have global initialized
+    if (db->global && db->global->branch_list) {
+        ebitmap_set_bit(&db->global->branch_list->declared.p_types_scope, value - 1, 1);
+    }
 
     // Resize type_attr_map and attr_type_map
     size_t new_size = sizeof(ebitmap_t) * db->p_types.nprim;
-    db->type_attr_map = realloc(db->type_attr_map, new_size);
-    db->attr_type_map = realloc(db->attr_type_map, new_size);
+    ebitmap_t *new_type_attr_map = realloc(db->type_attr_map, new_size);
+    ebitmap_t *new_attr_type_map = realloc(db->attr_type_map, new_size);
+    if (!new_type_attr_map || !new_attr_type_map) {
+        return -1;
+    }
+    db->type_attr_map = new_type_attr_map;
+    db->attr_type_map = new_attr_type_map;
     ebitmap_init(&db->type_attr_map[value - 1]);
     ebitmap_init(&db->attr_type_map[value - 1]);
     ebitmap_set_bit(&db->type_attr_map[value - 1], value - 1, 1);
 
-    // Re-index the policy database (critical for proper serialization)
+    // Re-index the policy database
+    // Note: For POLICY_KERN, policydb_index_decls handles NULL global gracefully
     if (policydb_index_decls(NULL, db) != 0 ||
         policydb_index_classes(db) != 0 ||
         policydb_index_others(NULL, db, 0) != 0) {

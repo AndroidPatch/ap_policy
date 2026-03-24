@@ -5,6 +5,7 @@
  */
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <errno.h>
 
 #ifndef HAVE_REALLOCARRAY

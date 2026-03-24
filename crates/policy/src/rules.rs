@@ -20,24 +20,9 @@ impl SePolicy {
         self.typeattribute(&[SEPOL_PROC_DOMAIN], &["mlstrustedsubject", "netdomain", "appdomain"]);
         self.type_(SEPOL_FILE_TYPE, &["file_type"]);
         self.typeattribute(&[SEPOL_FILE_TYPE], &["mlstrustedobject"]);
-        self.type_(SEPOL_LOG_TYPE, &["file_type"]);
-        self.typeattribute(&[SEPOL_LOG_TYPE], &["mlstrustedobject"]);
 
-        // Prevent anything to change sepolicy except ourselves
-        self.deny(&[], &["kernel"], &["security"], &["load_policy"]);
 
-        // Create unconstrained file type
-        self.allow(
-            &["domain"],
-            &[SEPOL_FILE_TYPE],
-            &["file", "dir", "fifo_file", "chr_file", "lnk_file", "sock_file"],
-            &[],
-        );
 
-        // Only allow zygote to open log pipe
-        self.allow(&["zygote"], &[SEPOL_LOG_TYPE], &["fifo_file"], &["open", "read"]);
-        // Allow all processes to output logs
-        self.allow(&["domain"], &[SEPOL_LOG_TYPE], &["fifo_file"], &["write"]);
 
         // Make our root domain unconstrained
         self.allow(
@@ -58,7 +43,7 @@ impl SePolicy {
         self.allowxperm(
             &[SEPOL_PROC_DOMAIN],
             &["fs_type", "dev_type", "file_type", "domain"],
-            &["blk_file", "fifo_file", "chr_file"],
+            &["blk_file", "fifo_file","chr_file", "chr_file"],
             &[Xperm::all()],
         );
         self.allowxperm(
@@ -80,47 +65,9 @@ impl SePolicy {
         self.allow(&["domain"], &[SEPOL_PROC_DOMAIN], &["fd"], &["use"]);
         self.allow(&["domain"], &[SEPOL_PROC_DOMAIN], &["fifo_file"], &["write", "read", "open", "getattr"]);
 
-        // Allow these processes to access MagiskSU and output logs
-        self.allow(
-            &["zygote", "shell", "platform_app", "system_app", "priv_app", "untrusted_app", "untrusted_app_all"],
-            &[SEPOL_PROC_DOMAIN],
-            &["unix_stream_socket"],
-            &["connectto", "getopt"],
-        );
+        self.allow(&["kernel"], &["adb_data_file"], &["file"], &[]);
+        self.allow(&["kernel"], &["fs_type","dev_type","file_type"], &["file"], &["read","write"]);
 
-        // Let selected domains access tmpfs files
-        self.allow(&["init", "zygote", "shell"], &["tmpfs"], &["file"], &[]);
-
-        // Allow magiskinit daemon to log to kmsg
-        self.allow(&["kernel"], &["rootfs", "tmpfs"], &["chr_file"], &["write"]);
-
-        // Allow magiskinit daemon to handle mock selinuxfs
-        self.allow(&["kernel"], &["tmpfs"], &["fifo_file"], &["open", "read", "write"]);
-
-        // For relabelling files
-        self.allow(&["rootfs"], &["labeledfs", "tmpfs"], &["filesystem"], &["associate"]);
-        self.allow(&[SEPOL_FILE_TYPE], &["pipefs", "devpts"], &["filesystem"], &["associate"]);
-        self.allow(&["kernel"], &[], &["file"], &["relabelto"]);
-        self.allow(&["kernel"], &["tmpfs"], &["file"], &["relabelfrom"]);
-
-        // Let init transit to SEPOL_PROC_DOMAIN
-        self.allow(&["kernel"], &["kernel"], &["process"], &["setcurrent"]);
-        self.allow(&["kernel"], &[SEPOL_PROC_DOMAIN], &["process"], &["dyntransition"]);
-
-        // Let init run stuffs
-        self.allow(&["init"], &[SEPOL_PROC_DOMAIN], &["process"], &[]);
-
-        // Zygisk rules
-        self.allow(&["zygote"], &["zygote"], &["process"], &["execmem"]);
-        self.allow(&["zygote"], &["fs_type"], &["filesystem"], &["unmount"]);
-        self.allow(&["system_server"], &["system_server"], &["process"], &["execmem"]);
-
-        // Shut llkd up
-        self.dontaudit(&["llkd"], &[SEPOL_PROC_DOMAIN], &["process"], &["ptrace"]);
-
-        // Keep /data/adb/* context
-        self.deny(&["init"], &["adb_data_file"], &["dir"], &["search"]);
-        self.deny(&["vendor_init"], &["adb_data_file"], &["dir"], &["search"]);
     }
 }
 

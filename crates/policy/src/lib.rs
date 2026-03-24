@@ -216,33 +216,32 @@ impl SePolicy {
 
     /// Add an allow rule
     pub fn allow(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
-                    for &perm in p {
+        // Empty slice = wildcard (pass "" to C layer which treats it as NULL/all)
+        let srcs: &[&str] = if s.is_empty() { &[""] } else { s };
+        let tgts: &[&str] = if t.is_empty() { &[""] } else { t };
+        let clss: &[&str] = if c.is_empty() { &[""] } else { c };
+        let perms: &[&str] = if p.is_empty() { &[""] } else { p };
+        for &src in srcs {
+            for &tgt in tgts {
+                for &cls in clss {
+                    for &perm in perms {
                         self.add_rule(src, tgt, cls, perm, AVTAB_ALLOWED as i32, 0);
                     }
                 }
             }
         }
-        if s.is_empty() || t.is_empty() || c.is_empty() || p.is_empty() {
-            self.add_rule(
-                if s.is_empty() { "" } else { s[0] },
-                if t.is_empty() { "" } else { t[0] },
-                if c.is_empty() { "" } else { c[0] },
-                "",
-                AVTAB_ALLOWED as i32,
-                if p.is_empty() { 0 } else { 1 },
-            );
-        }
     }
 
     /// Add a deny rule
     pub fn deny(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
-                    for &perm in p {
+        let srcs: &[&str] = if s.is_empty() { &[""] } else { s };
+        let tgts: &[&str] = if t.is_empty() { &[""] } else { t };
+        let clss: &[&str] = if c.is_empty() { &[""] } else { c };
+        let perms: &[&str] = if p.is_empty() { &[""] } else { p };
+        for &src in srcs {
+            for &tgt in tgts {
+                for &cls in clss {
+                    for &perm in perms {
                         self.add_rule(src, tgt, cls, perm, AVTAB_ALLOWED as i32, 1);
                     }
                 }

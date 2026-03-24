@@ -2,10 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sepol/policydb/policydb.h>
 
 #if defined(__ANDROID__) || defined(__BSD__)
 // funopen declaration for Android/BSD
@@ -303,38 +305,37 @@ void sepol_print_avtab_rules(policydb_t *db) {
                 class_datum_t *clz = db->class_val_to_struct[node->key.target_class - 1];
                 if (!clz) continue;
 
+                // Build a value→name lookup table for this class (covers all hash buckets)
+                // Max 32 permissions per class (uint32_t bitmask)
+                const char *perm_names[32] = { NULL };
+                if (clz->permissions.table) {
+                    for (uint32_t b = 0; b < clz->permissions.table->size; b++) {
+                        for (hashtab_ptr_t hp = clz->permissions.table->htable[b]; hp; hp = hp->next) {
+                            perm_datum_t *pd = (perm_datum_t *)hp->datum;
+                            if (pd && pd->s.value >= 1 && pd->s.value <= 32)
+                                perm_names[pd->s.value - 1] = (const char *)hp->key;
+                        }
+                    }
+                }
+                if (clz->comdatum && clz->comdatum->permissions.table) {
+                    for (uint32_t b = 0; b < clz->comdatum->permissions.table->size; b++) {
+                        for (hashtab_ptr_t hp = clz->comdatum->permissions.table->htable[b]; hp; hp = hp->next) {
+                            perm_datum_t *pd = (perm_datum_t *)hp->datum;
+                            if (pd && pd->s.value >= 1 && pd->s.value <= 32 && !perm_names[pd->s.value - 1])
+                                perm_names[pd->s.value - 1] = (const char *)hp->key;
+                        }
+                    }
+                }
+
                 // Print permissions
                 int first = 1;
                 for (uint32_t bit = 0; bit < 32; bit++) {
-                    if (data & (1u << bit)) {
-                        const char *perm = NULL;
-                        // Check class permissions
-                        if (clz->permissions.table) {
-                            for (hashtab_ptr_t p = clz->permissions.table->htable[0]; p && !perm; p = p->next) {
-                                perm_datum_t *pd = (perm_datum_t *)p->datum;
-                                if (pd && pd->s.value == bit + 1) {
-                                    perm = (const char *)p->key;
-                                    break;
-                                }
-                            }
+                    if ((data & (1u << bit)) && perm_names[bit]) {
+                        if (first) {
+                            printf("%s %s %s %s {", name, src, tgt, cls);
+                            first = 0;
                         }
-                        // Check common permissions if not found
-                        if (!perm && clz->comdatum && clz->comdatum->permissions.table) {
-                            for (hashtab_ptr_t p = clz->comdatum->permissions.table->htable[0]; p && !perm; p = p->next) {
-                                perm_datum_t *pd = (perm_datum_t *)p->datum;
-                                if (pd && pd->s.value == bit + 1) {
-                                    perm = (const char *)p->key;
-                                    break;
-                                }
-                            }
-                        }
-                        if (perm) {
-                            if (first) {
-                                printf("%s %s %s %s {", name, src, tgt, cls);
-                                first = 0;
-                            }
-                            printf(" %s", perm);
-                        }
+                        printf(" %s", perm_names[bit]);
                     }
                 }
                 if (!first) {
@@ -449,52 +450,326 @@ void sepol_print_genfscon(policydb_t *db) {
     }
 }
 
+// Core rule insertion for a resolved (src, tgt, cls) triple — mirrors Magisk's add_rule
+static void add_rule_impl(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                          class_datum_t *cls, perm_datum_t *perm, int effect, int invert) {
+    avtab_key_t key;
+    key.source_type = src->s.value;
+    key.target_type = tgt->s.value;
+    key.target_class = cls->s.value;
+    key.specified = (uint16_t)effect;
+
+    // Find existing node or create a new one
+    avtab_datum_t *node = avtab_search(&db->te_avtab, &key);
+    if (!node) {
+        avtab_datum_t init;
+        // AUDITDENY nodes are &= assigned, so initialize to all-ones; others to 0
+        init.data = (effect == AVTAB_AUDITDENY) ? ~0U : 0U;
+        init.xperms = NULL;
+        avtab_ptr_t new_node = avtab_insert_nonunique(&db->te_avtab, &key, &init);
+        if (!new_node) return;
+        node = &new_node->datum;
+    }
+
+    uint32_t mask = perm ? (1U << (perm->s.value - 1)) : ~0U;
+    if (invert) {
+        node->data &= ~mask;
+    } else {
+        node->data |= mask;
+    }
+}
+
+// Expand wildcards (NULL src/tgt/cls) and apply rule — mirrors Magisk's add_rule overload
+static void expand_rule(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                        class_datum_t *cls, perm_datum_t *perm,
+                        int effect, int invert);
+
+static void expand_rule(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                        class_datum_t *cls, perm_datum_t *perm,
+                        int effect, int invert) {
+    // Determine strip_av: for AUDITDENY, stripping means adding (invert=false),
+    // for others stripping means removing (invert=true)
+    int strip_av = (effect == AVTAB_AUDITDENY) == !invert;
+
+    if (!src) {
+        if (strip_av) {
+            // Must iterate all types (not just attrs) for correct stripping
+            for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+                for (hashtab_ptr_t n = db->p_types.table->htable[i]; n; n = n->next) {
+                    type_datum_t *type = (type_datum_t *)n->datum;
+                    if (type) expand_rule(db, type, tgt, cls, perm, effect, invert);
+                }
+            }
+        } else {
+            // Optimization: iterate attributes only
+            for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+                for (hashtab_ptr_t n = db->p_types.table->htable[i]; n; n = n->next) {
+                    type_datum_t *type = (type_datum_t *)n->datum;
+                    if (type && type->flavor == TYPE_ATTRIB)
+                        expand_rule(db, type, tgt, cls, perm, effect, invert);
+                }
+            }
+        }
+    } else if (!tgt) {
+        if (strip_av) {
+            for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+                for (hashtab_ptr_t n = db->p_types.table->htable[i]; n; n = n->next) {
+                    type_datum_t *type = (type_datum_t *)n->datum;
+                    if (type) expand_rule(db, src, type, cls, perm, effect, invert);
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+                for (hashtab_ptr_t n = db->p_types.table->htable[i]; n; n = n->next) {
+                    type_datum_t *type = (type_datum_t *)n->datum;
+                    if (type && type->flavor == TYPE_ATTRIB)
+                        expand_rule(db, src, type, cls, perm, effect, invert);
+                }
+            }
+        }
+    } else if (!cls) {
+        for (uint32_t i = 0; i < db->p_classes.table->size; i++) {
+            for (hashtab_ptr_t n = db->p_classes.table->htable[i]; n; n = n->next) {
+                class_datum_t *c = (class_datum_t *)n->datum;
+                if (c) expand_rule(db, src, tgt, c, perm, effect, invert);
+            }
+        }
+    } else {
+        add_rule_impl(db, src, tgt, cls, perm, effect, invert);
+    }
+}
+
 // Add a rule
 int sepol_add_rule(policydb_t *db, const char *s, const char *t, const char *c, const char *p, int effect, int invert) {
     if (!db) return -1;
 
-    type_datum_t *src = s && *s ? find_type(db, s) : NULL;
-    type_datum_t *tgt = t && *t ? find_type(db, t) : NULL;
-    class_datum_t *cls = c && *c ? find_class(db, c) : NULL;
-    perm_datum_t *perm = p && *p && cls ? find_perm(cls, p) : NULL;
+    type_datum_t *src = (s && *s) ? find_type(db, s) : NULL;
+    type_datum_t *tgt = (t && *t) ? find_type(db, t) : NULL;
+    class_datum_t *cls = (c && *c) ? find_class(db, c) : NULL;
+    perm_datum_t *perm = (p && *p && cls) ? find_perm(cls, p) : NULL;
 
     if ((s && *s && !src) || (t && *t && !tgt) || (c && *c && !cls) || (p && *p && !perm)) {
         return -1;
     }
 
-    // Simple implementation for direct rules
-    if (src && tgt && cls) {
-        avtab_key_t key;
-        key.source_type = src->s.value;
-        key.target_type = tgt->s.value;
-        key.target_class = cls->s.value;
-        key.specified = effect;
+    expand_rule(db, src, tgt, cls, perm, effect, invert);
+    return 0;
+}
 
-        avtab_datum_t datum;
-        datum.data = perm ? (1U << (perm->s.value - 1)) : ~0U;
-        datum.xperms = NULL;
+// Internal: avtab_hash is defined in avtab.c but not in the public header
+extern int avtab_hash(struct avtab_key *keyp, uint32_t mask);
 
-        if (avtab_insert(&db->te_avtab, &key, &datum) != 0) {
-            // Try to update existing
-            avtab_datum_t *existing = avtab_search(&db->te_avtab, &key);
-            if (existing) {
-                if (invert) {
-                    existing->data &= ~datum.data;
-                } else {
-                    existing->data |= datum.data;
-                }
+#define ioctl_driver(x) ((x) >> 8 & 0xFF)
+#define ioctl_func(x)   ((x) & 0xFF)
+
+// Remove a node from the avtab (mirrors Magisk's avtab_remove_node)
+static int xperm_remove_node(avtab_t *h, avtab_ptr_t node) {
+    if (!h || !h->htable) return -1;
+    int hvalue = avtab_hash(&node->key, h->mask);
+    avtab_ptr_t prev = NULL;
+    avtab_ptr_t cur = h->htable[hvalue];
+    while (cur) {
+        if (cur == node) break;
+        prev = cur;
+        cur = cur->next;
+    }
+    if (!cur) return -1;
+    if (prev)
+        prev->next = node->next;
+    else
+        h->htable[hvalue] = node->next;
+    h->nel--;
+    free(node->datum.xperms);
+    free(node);
+    return 0;
+}
+
+// Core xperm rule application for a resolved (src, tgt, cls) triple
+static void add_xperm_rule_impl(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                                class_datum_t *cls, uint16_t low, uint16_t high,
+                                int reset, int effect) {
+    avtab_key_t key;
+    key.source_type = src->s.value;
+    key.target_type = tgt->s.value;
+    key.target_class = cls->s.value;
+    key.specified = (uint16_t)effect;
+
+    // Collect existing nodes: node_list[0..255] = function nodes indexed by driver byte
+    //                         node_list[256]    = driver node
+    avtab_ptr_t node_list[257];
+    memset(node_list, 0, sizeof(node_list));
+    avtab_ptr_t driver_node = NULL;
+
+    for (avtab_ptr_t node = avtab_search_node(&db->te_avtab, &key); node;
+         node = avtab_search_node_next(node, key.specified)) {
+        if (!node->datum.xperms) continue;
+        if (node->datum.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
+            driver_node = node;
+            node_list[256] = node;
+        } else if (node->datum.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
+            node_list[node->datum.xperms->driver] = node;
+        }
+    }
+
+    // Helper: allocate and insert a new driver node
+#define new_driver_node() ({ \
+    avtab_datum_t avdatum = { .data = 0, .xperms = NULL }; \
+    avtab_ptr_t _n = avtab_insert_nonunique(&db->te_avtab, &key, &avdatum); \
+    if (_n) { \
+        _n->datum.xperms = calloc(1, sizeof(avtab_extended_perms_t)); \
+        if (_n->datum.xperms) { \
+            _n->datum.xperms->specified = AVTAB_XPERMS_IOCTLDRIVER; \
+            _n->datum.xperms->driver = 0; \
+        } \
+    } \
+    _n; \
+})
+
+    // Helper: allocate and insert a new function node for a given driver byte
+#define new_func_node(drv) ({ \
+    avtab_datum_t avdatum = { .data = 0, .xperms = NULL }; \
+    avtab_ptr_t _n = avtab_insert_nonunique(&db->te_avtab, &key, &avdatum); \
+    if (_n) { \
+        _n->datum.xperms = calloc(1, sizeof(avtab_extended_perms_t)); \
+        if (_n->datum.xperms) { \
+            _n->datum.xperms->specified = AVTAB_XPERMS_IOCTLFUNCTION; \
+            _n->datum.xperms->driver = (uint8_t)(drv); \
+        } \
+    } \
+    _n; \
+})
+
+    if (reset) {
+        // Remove all existing function nodes
+        for (int i = 0; i <= 0xFF; i++) {
+            if (node_list[i]) {
+                xperm_remove_node(&db->te_avtab, node_list[i]);
+                node_list[i] = NULL;
+            }
+        }
+        // Zero out driver node perms if it exists
+        if (driver_node && driver_node->datum.xperms) {
+            memset(driver_node->datum.xperms->perms, 0,
+                   sizeof(avtab_extended_perms_t) - offsetof(avtab_extended_perms_t, perms));
+        }
+
+        // Create driver node if needed, fill all driver bits
+        if (!driver_node) driver_node = new_driver_node();
+        if (!driver_node || !driver_node->datum.xperms) goto cleanup;
+
+        memset(driver_node->datum.xperms->perms, ~0,
+               sizeof(driver_node->datum.xperms->perms));
+
+        if (ioctl_driver(low) != ioctl_driver(high)) {
+            // Cross-driver range: clear those driver bits
+            for (int i = ioctl_driver(low); i <= ioctl_driver(high); i++) {
+                xperm_clear(i, driver_node->datum.xperms->perms);
+            }
+        } else {
+            // Same driver: clear that driver bit, create func node with all bits set,
+            // then clear the specified function range
+            uint8_t drv = (uint8_t)ioctl_driver(low);
+            xperm_clear(drv, driver_node->datum.xperms->perms);
+
+            avtab_ptr_t fnode = node_list[drv];
+            if (!fnode) {
+                fnode = new_func_node(drv);
+                node_list[drv] = fnode;
+            }
+            if (!fnode || !fnode->datum.xperms) goto cleanup;
+            // Fill all func bits
+            memset(fnode->datum.xperms->perms, ~0,
+                   sizeof(fnode->datum.xperms->perms));
+            // Clear the specified range
+            for (int i = ioctl_func(low); i <= ioctl_func(high); i++) {
+                xperm_clear(i, fnode->datum.xperms->perms);
+            }
+        }
+    } else {
+        if (ioctl_driver(low) != ioctl_driver(high)) {
+            // Cross-driver range: set bits in the driver node
+            if (!driver_node) driver_node = new_driver_node();
+            if (!driver_node || !driver_node->datum.xperms) goto cleanup;
+            for (int i = ioctl_driver(low); i <= ioctl_driver(high); i++) {
+                xperm_set(i, driver_node->datum.xperms->perms);
+            }
+        } else {
+            // Same driver: set bits in the function node for that driver
+            uint8_t drv = (uint8_t)ioctl_driver(low);
+            avtab_ptr_t fnode = node_list[drv];
+            if (!fnode) {
+                fnode = new_func_node(drv);
+                node_list[drv] = fnode;
+            }
+            if (!fnode || !fnode->datum.xperms) goto cleanup;
+            for (int i = ioctl_func(low); i <= ioctl_func(high); i++) {
+                xperm_set(i, fnode->datum.xperms->perms);
             }
         }
     }
 
-    return 0;
+cleanup:
+#undef new_driver_node
+#undef new_func_node
+    return;
 }
 
-// Add xperm rule (simplified)
-int sepol_add_xperm_rule(policydb_t *db, const char *s, const char *t, const char *c, uint16_t low, uint16_t high, int reset, int effect) {
-    // Simplified implementation - would need more complex xperm handling
-    (void)db; (void)s; (void)t; (void)c; (void)low; (void)high; (void)reset; (void)effect;
-    return -1;
+// Expand wildcard (NULL src/tgt/cls) and call add_xperm_rule_impl
+static void expand_xperm_rule(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                               class_datum_t *cls, uint16_t low, uint16_t high,
+                               int reset, int effect);
+
+static void expand_xperm_rule(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
+                               class_datum_t *cls, uint16_t low, uint16_t high,
+                               int reset, int effect) {
+    if (!src) {
+        for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+            for (hashtab_ptr_t node = db->p_types.table->htable[i]; node; node = node->next) {
+                type_datum_t *type = (type_datum_t *)node->datum;
+                if (type && type->flavor == TYPE_ATTRIB)
+                    expand_xperm_rule(db, type, tgt, cls, low, high, reset, effect);
+            }
+        }
+    } else if (!tgt) {
+        for (uint32_t i = 0; i < db->p_types.table->size; i++) {
+            for (hashtab_ptr_t node = db->p_types.table->htable[i]; node; node = node->next) {
+                type_datum_t *type = (type_datum_t *)node->datum;
+                if (type && type->flavor == TYPE_ATTRIB)
+                    expand_xperm_rule(db, src, type, cls, low, high, reset, effect);
+            }
+        }
+    } else if (!cls) {
+        for (uint32_t i = 0; i < db->p_classes.table->size; i++) {
+            for (hashtab_ptr_t node = db->p_classes.table->htable[i]; node; node = node->next) {
+                class_datum_t *c = (class_datum_t *)node->datum;
+                if (c) add_xperm_rule_impl(db, src, tgt, c, low, high, reset, effect);
+            }
+        }
+    } else {
+        add_xperm_rule_impl(db, src, tgt, cls, low, high, reset, effect);
+    }
+}
+
+// Add xperm rule (ported from Magisk's sepol_impl::add_xperm_rule)
+int sepol_add_xperm_rule(policydb_t *db, const char *s, const char *t, const char *c,
+                         uint16_t low, uint16_t high, int reset, int effect) {
+    if (!db) return -1;
+
+    if (db->policyvers < POLICYDB_VERSION_XPERMS_IOCTL) {
+        fprintf(stderr, "policy version %u does not support ioctl xperms rules\n",
+                db->policyvers);
+        return -1;
+    }
+
+    type_datum_t *src = (s && *s) ? find_type(db, s) : NULL;
+    type_datum_t *tgt = (t && *t) ? find_type(db, t) : NULL;
+    class_datum_t *cls = (c && *c) ? find_class(db, c) : NULL;
+
+    if ((s && *s && !src) || (t && *t && !tgt) || (c && *c && !cls))
+        return -1;
+
+    expand_xperm_rule(db, src, tgt, cls, low, high, reset, effect);
+    return 0;
 }
 
 // Add type rule

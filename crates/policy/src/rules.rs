@@ -43,7 +43,7 @@ impl SePolicy {
         self.allowxperm(
             &[SEPOL_PROC_DOMAIN],
             &["fs_type", "dev_type", "file_type", "domain"],
-            &["blk_file", "fifo_file","chr_file", "chr_file"],
+            &["blk_file", "fifo_file","chr_file", "file"],
             &[Xperm::all()],
         );
         self.allowxperm(

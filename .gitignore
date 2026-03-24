@@ -23,7 +23,7 @@
 ehthumbs.db
 Thumbs.db
 desktop.ini
-
+debug.sh
 # Backup files
 *.bak
 *.orig

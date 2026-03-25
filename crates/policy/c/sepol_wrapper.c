@@ -201,12 +201,6 @@ int sepol_db_to_file(policydb_t *db, const char *path) {
         return -1;
     }
 
-    // Truncate if regular file and has content
-    struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-        (void)ftruncate(fd, 0);
-    }
-
     // Write all data at once (required for /sys/fs/selinux/load)
     size_t total = 0;
     while (total < size) {
@@ -261,12 +255,13 @@ void sepol_print_types(policydb_t *db, int attributes) {
             if (!first) {
                 printf(" }\n");
             }
+            // Print permissive
+            if (ebitmap_get_bit(&db->permissive_map, type->s.value)) {
+                printf("permissive %s\n", name);
+            }
         }
 
-        // Print permissive
-        if (ebitmap_get_bit(&db->permissive_map, type->s.value)) {
-            printf("permissive %s\n", name);
-        }
+
     }
 }
 
@@ -445,6 +440,19 @@ void sepol_print_genfscon(policydb_t *db) {
     }
 }
 
+// Forward declaration — xperm_remove_node is defined later but used in add_rule_impl
+static int xperm_remove_node(avtab_t *h, avtab_ptr_t node);
+
+// Remove a redundant avtab node (data has no effect) — mirrors Magisk's is_redundant check
+static int is_redundant(avtab_ptr_t node) {
+    switch (node->key.specified) {
+        case AVTAB_AUDITDENY:
+            return node->datum.data == ~0U;
+        default:
+            return node->datum.data == 0U;
+    }
+}
+
 // Core rule insertion for a resolved (src, tgt, cls) triple — mirrors Magisk's add_rule
 static void add_rule_impl(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
                           class_datum_t *cls, perm_datum_t *perm, int effect, int invert) {
@@ -455,23 +463,31 @@ static void add_rule_impl(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
     key.specified = (uint16_t)effect;
 
     // Find existing node or create a new one
-    avtab_datum_t *node = avtab_search(&db->te_avtab, &key);
+    avtab_ptr_t node = avtab_search_node(&db->te_avtab, &key);
     if (!node) {
         avtab_datum_t init;
         // AUDITDENY nodes are &= assigned, so initialize to all-ones; others to 0
         init.data = (effect == AVTAB_AUDITDENY) ? ~0U : 0U;
         init.xperms = NULL;
-        avtab_ptr_t new_node = avtab_insert_nonunique(&db->te_avtab, &key, &init);
-        if (!new_node) return;
-        node = &new_node->datum;
+        node = avtab_insert_nonunique(&db->te_avtab, &key, &init);
+        if (!node) return;
     }
 
-    uint32_t mask = perm ? (1U << (perm->s.value - 1)) : ~0U;
     if (invert) {
-        node->data &= ~mask;
+        if (perm)
+            node->datum.data &= ~(1U << (perm->s.value - 1));
+        else
+            node->datum.data = 0U;
     } else {
-        node->data |= mask;
+        if (perm)
+            node->datum.data |= 1U << (perm->s.value - 1);
+        else
+            node->datum.data = ~0U;
     }
+
+    // Remove node if it has become redundant (mirrors Magisk's is_redundant cleanup)
+    if (is_redundant(node))
+        xperm_remove_node(&db->te_avtab, node);
 }
 
 // Expand wildcards (NULL src/tgt/cls) and apply rule — mirrors Magisk's add_rule overload
@@ -899,8 +915,9 @@ int sepol_add_genfscon(policydb_t *db, const char *fs, const char *path, const c
         genfs->head = ocon;
     }
 
-    // Copy context in (overwrite if already set)
-    memset(ocon->context, 0, sizeof(ocon->context));
+    if (ocon->context[0].user) { 
+        context_destroy(&ocon->context[0]);
+    }
     memcpy(&ocon->context[0], new_ctx, sizeof(*new_ctx));
     free(new_ctx);
     return 0;
@@ -941,7 +958,9 @@ int sepol_add_type(policydb_t *db, const char *name, uint32_t flavor) {
     // Resize type_attr_map and attr_type_map
     size_t new_size = sizeof(ebitmap_t) * db->p_types.nprim;
     ebitmap_t *new_type_attr_map = realloc(db->type_attr_map, new_size);
+    if (new_type_attr_map) db->type_attr_map = new_type_attr_map;
     ebitmap_t *new_attr_type_map = realloc(db->attr_type_map, new_size);
+    if (new_attr_type_map) db->attr_type_map = new_attr_type_map;
     if (!new_type_attr_map || !new_attr_type_map) {
         return -1;
     }
@@ -998,6 +1017,25 @@ int sepol_add_typeattribute(policydb_t *db, const char *type_name, const char *a
 
     ebitmap_set_bit(&db->type_attr_map[type->s.value - 1], attr->s.value - 1, 1);
     ebitmap_set_bit(&db->attr_type_map[attr->s.value - 1], type->s.value - 1, 1);
+
+    // Expand constraint expressions: for every class constraint, if an expression
+    // references the attribute being assigned, add the new type to it as well.
+    // This is required for MLS constraints (mlstrustedsubject / mlstrustedobject etc.)
+    // to recognise the new type — mirrors Magisk's sepol_impl::add_typeattribute.
+    for (uint32_t i = 0; i < db->p_classes.table->size; i++) {
+        for (hashtab_ptr_t hp = db->p_classes.table->htable[i]; hp; hp = hp->next) {
+            class_datum_t *cls = (class_datum_t *)hp->datum;
+            if (!cls) continue;
+            for (constraint_node_t *n = cls->constraints; n; n = n->next) {
+                for (constraint_expr_t *e = n->expr; e; e = e->next) {
+                    if (e->expr_type == CEXPR_NAMES && e->type_names &&
+                        ebitmap_get_bit(&e->type_names->types, attr->s.value - 1)) {
+                        ebitmap_set_bit(&e->names, type->s.value - 1, 1);
+                    }
+                }
+            }
+        }
+    }
 
     return 0;
 }

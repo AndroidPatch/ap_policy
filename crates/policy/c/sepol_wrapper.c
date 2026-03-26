@@ -8,6 +8,19 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <sepol/policydb/policydb.h>
+#include <sepol/policydb/conditional.h>
+#include <sepol/policydb/constraint.h>
+
+// Android-specific flags (may not be in all libsepol versions)
+#ifndef POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
+#define POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE  (1U << 31)
+#endif
+#ifndef POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH
+#define POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH (1U << 30)
+#endif
+#ifndef POLICYDB_CONFIG_ANDROID_EXTRA_MASK
+#define POLICYDB_CONFIG_ANDROID_EXTRA_MASK (POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE | POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH)
+#endif
 
 #if defined(__ANDROID__) || defined(__BSD__)
 // funopen declaration for Android/BSD
@@ -16,6 +29,82 @@ FILE *funopen(void *cookie, int (*readfn)(void *, char *, int), int (*writefn)(v
 #else
 #define HAVE_FUNOPEN 0
 #endif
+
+void sepol_disable_neverallow(policydb_t *db) {
+    if (!db) return;
+
+    // Remove all constraint nodes from all classes
+    // Note: This removes constraints but doesn't free them properly since
+    // constraint_node_destroy is not available in standard libsepol.
+    // In practice, this is used for live patching where the policy is
+    // short-lived, so the memory leak is acceptable.
+    for (uint32_t i = 0; i < db->p_classes.table->size; i++) {
+        for (hashtab_ptr_t hp = db->p_classes.table->htable[i]; hp; hp = hp->next) {
+            class_datum_t *cls = (class_datum_t *)hp->datum;
+            if (!cls) continue;
+
+            // Simply clear the constraints pointer
+            // Memory will be leaked but this is acceptable for live patching
+            cls->constraints = NULL;
+        }
+    }
+}
+
+void sepol_strip_conditional(policydb_t *db) {
+    if (!db || !db->cond_list) return;
+
+    cond_node_t *n = db->cond_list;
+    db->cond_list = NULL;
+
+    while (n) {
+        cond_node_t *next = n->next;
+        cond_node_destroy(n);
+        n = next;
+    }
+}
+
+void sepol_preserve_policycaps(policydb_t *dst, policydb_t *src) {
+    if (!dst || !src) return;
+
+    ebitmap_destroy(&dst->policycaps);
+    ebitmap_init(&dst->policycaps);
+
+    for (uint32_t i = 0; i <= src->policycaps.highbit; i++) {
+        if (ebitmap_get_bit(&src->policycaps, i)) {
+            ebitmap_set_bit(&dst->policycaps, i, 1);
+        }
+    }
+}
+
+// Android-specific flag handling
+uint32_t sepol_get_android_flags(policydb_t *db) {
+    if (!db) return 0;
+    return db->android_extra;
+}
+
+void sepol_set_android_flags(policydb_t *db, uint32_t flags) {
+    if (!db) return;
+    db->android_extra = flags;
+}
+
+int sepol_reindex_full(policydb_t *db) {
+    if (!db) return -1;
+
+    if (policydb_index_decls(NULL, db) != 0)
+        return -1;
+
+    if (policydb_index_classes(db) != 0)
+        return -1;
+
+    if (policydb_index_others(NULL, db, 0) != 0)
+        return -1;
+
+    // Note: policydb_expand is not available in standard libsepol
+    // For Android live patching, the basic reindexing above is sufficient
+    // The type/attribute expansion happens automatically during rule addition
+
+    return 0;
+}
 
 // Helper function to duplicate a string
 static char *dup_str(const char *s) {
@@ -195,23 +284,26 @@ int sepol_db_to_file(policydb_t *db, const char *path) {
     }
 
     // Open file for writing
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // NOTE: Do NOT use O_TRUNC for /sys/fs/selinux/load - it's a special kernel interface
+    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
         free(data);
         return -1;
     }
 
-    // Write all data at once (required for /sys/fs/selinux/load)
-    size_t total = 0;
-    while (total < size) {
-        ssize_t written = write(fd, data + total, size - total);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            free(data);
-            return -1;
-        }
-        total += written;
+    // If file has existing content, truncate it explicitly
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        ftruncate(fd, 0);
+    }
+
+    // Write all data in one write() call (required for /sys/fs/selinux/load)
+    // The kernel expects the entire policy in a single write operation
+    ssize_t written = write(fd, data, size);
+    if (written < 0 || (size_t)written != size) {
+        close(fd);
+        free(data);
+        return -1;
     }
 
     close(fd);
@@ -461,7 +553,6 @@ static void add_rule_impl(policydb_t *db, type_datum_t *src, type_datum_t *tgt,
     key.target_type = tgt->s.value;
     key.target_class = cls->s.value;
     key.specified = (uint16_t)effect;
-
     // Find existing node or create a new one
     avtab_ptr_t node = avtab_search_node(&db->te_avtab, &key);
     if (!node) {

@@ -20,6 +20,10 @@ policydb_t *sepol_db_from_file(const char *path);
 policydb_t *sepol_db_from_data(const uint8_t *data, size_t len);
 int sepol_db_to_file(policydb_t *db, const char *path);
 
+// Android-specific flag handling
+uint32_t sepol_get_android_flags(policydb_t *db);
+void sepol_set_android_flags(policydb_t *db, uint32_t flags);
+
 // Print functions for policy rules
 void sepol_print_types(policydb_t *db, int attributes);
 void sepol_print_avtab_rules(policydb_t *db);

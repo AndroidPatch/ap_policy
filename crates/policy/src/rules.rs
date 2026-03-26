@@ -10,7 +10,7 @@ pub const SEPOL_PROC_DOMAIN: &str = "magisk";
 /// Default file type for Magisk
 pub const SEPOL_FILE_TYPE: &str = "magisk_file";
 /// Default log type for Magisk
-pub const SEPOL_LOG_TYPE: &str = "magisk_log";
+pub const SEPOL_LOG_TYPE: &str = "magisk_log_file";
 
 impl SePolicy {
     /// Apply built-in Magisk rules to the policy

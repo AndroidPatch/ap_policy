@@ -9,8 +9,3 @@ linker = "x86_64-linux-android30-clang"
 
 [target.i686-linux-android]
 linker = "i686-linux-android30-clang"
-
-[alias]
-android-sysprop = "run -p cargo-android-sysprop --bin cargo-android-sysprop --"
-push-resetprop = "run -p cargo-android-sysprop --bin resetprop-tester -- --target aarch64-linux-android"
-test-resetprop = "run -p cargo-android-sysprop --bin resetprop-tester -- --target aarch64-linux-android --run-test"

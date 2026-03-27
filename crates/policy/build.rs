@@ -131,22 +131,8 @@ fn main() {
             .include(&sepol_include);
         compat_build.compile("compat");
 
-        // Now compile our wrapper
-        let mut wrapper_build = cc::Build::new();
-        wrapper_build
-            .file("c/sepol_wrapper.c")
-            .include(&sepol_include)
-            .include(&sepol_cil_include)
-            .include(&out_dir);
-        if !is_android {
-            wrapper_build.define("HAVE_REALLOCARRAY", None);
-        }
-
-        wrapper_build.compile("sepol_wrapper");
-
         println!("cargo:rustc-link-lib=static=sepol");
         println!("cargo:rustc-link-lib=static=compat");
-        println!("cargo:rustc-link-lib=static=sepol_wrapper");
 
         // Link math library on Unix
         if !is_android && env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
@@ -160,8 +146,8 @@ fn main() {
     }
 
     // Tell cargo to invalidate the build when files change
-    println!("cargo:rerun-if-changed=c/sepol_wrapper.c");
-    println!("cargo:rerun-if-changed=c/sepol_wrapper.h");
     println!("cargo:rerun-if-changed=c/compat.c");
+    println!("cargo:rerun-if-changed=src/sepol.rs");
+    println!("cargo:rerun-if-changed=src/sepol_impl.rs");
     println!("cargo:rerun-if-changed=build.rs");
 }

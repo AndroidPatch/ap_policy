@@ -10,6 +10,8 @@ use std::path::Path;
 
 #[cfg(feature = "sepol_linked")]
 mod sepol;
+#[cfg(feature = "sepol_linked")]
+mod sepol_impl;
 pub mod rules;
 pub mod statement;
 
@@ -89,6 +91,7 @@ pub struct SePolicy {
     inner: SePolicyInner,
 }
 
+#[cfg(feature = "sepol_linked")]
 #[cfg(feature = "sepol_linked")]
 impl Drop for SePolicy {
     fn drop(&mut self) {

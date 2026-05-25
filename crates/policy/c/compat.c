@@ -1,7 +1,7 @@
 /*
  * Compatibility functions for Android/non-glibc systems
  *
- * reallocarray is a BSD/glibc extension that's not available on Android
+ * reallocarray is a BSD/glibc extension that's not available on Android 9 and below
  */
 
 #include <stdlib.h>

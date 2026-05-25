@@ -93,6 +93,30 @@ unsafe fn context_to_str(db: *mut policydb, ctx: *mut context_struct_t) -> *mut 
     result
 }
 
+unsafe fn write_buffer_to_path(path: *const c_char, data: *const c_void, size: usize) -> c_int {
+    let fd = libc::open(
+        path,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+        0o644,
+    );
+    if fd < 0 {
+        return -1;
+    }
+
+    let mut st = mem::zeroed::<libc::stat>();
+    if libc::fstat(fd, &mut st) == 0 && st.st_size > 0 {
+        libc::ftruncate(fd, 0);
+    }
+
+    let written = libc::write(fd, data, size);
+    let close_result = libc::close(fd);
+
+    if written < 0 || written as usize != size || close_result != 0 {
+        return -1;
+    }
+    0
+}
+
 // ---- Remove node from avtab ----
 
 unsafe fn xperm_remove_node(h: *mut avtab_t, node: avtab_ptr_t) -> c_int {
@@ -522,42 +546,9 @@ pub unsafe extern "C" fn sepol_strip_conditional(db: *mut policydb) {
         return;
     }
 
-    let mut n = (*db).cond_list;
+    let list = (*db).cond_list;
     (*db).cond_list = ptr::null_mut();
-
-    while !n.is_null() {
-        // cond_node_t is opaque in our binding; we must access its 'next' field
-        // The cond_node struct starts with: int cur_state, *expr, *true_list, *false_list,
-        // *avtrue_list, *avfalse_list, unsigned nbools, uint32_t bool_ids[5], uint32_t expr_pre_comp,
-        // *next, uint32_t flags
-        // We call cond_node_destroy which frees the node's internals but NOT the node itself
-        // (Looking at libsepol source, cond_node_destroy frees internals and the node struct)
-        // The C code calls cond_node_destroy(n) then n = next — so cond_node_destroy frees n
-        // We need to get 'next' before calling destroy
-
-        // Since cond_node_t is opaque, we need the offset of 'next'.
-        // Layout of cond_node:
-        //   int cur_state;                    4 bytes
-        //   cond_expr_t *expr;                8 bytes
-        //   cond_av_list_t *true_list;        8 bytes
-        //   cond_av_list_t *false_list;       8 bytes
-        //   avrule_t *avtrue_list;            8 bytes
-        //   avrule_t *avfalse_list;           8 bytes
-        //   unsigned int nbools;              4 bytes  (+4 padding after cur_state to align)
-        //   Actually after int (4), pointer alignment => 4 bytes padding, then 8*5 pointers = 40 + 4+4 = 48
-        // Let's compute: int(4)+pad(4)=8, ptr(8)=16, ptr(8)=24, ptr(8)=32, ptr(8)=40, ptr(8)=48
-        //   unsigned nbools (4) = 52
-        //   uint32_t bool_ids[5] (20) = 72
-        //   uint32_t expr_pre_comp (4) = 76
-        //   pad(4) = 80
-        //   *next (8) = 88
-        //   uint32_t flags (4) = 92
-        // So next is at offset 80 on 64-bit systems
-        let next_ptr = (n as *const u8).add(80) as *const *mut cond_node_t;
-        let next = *next_ptr;
-        cond_node_destroy(n);
-        n = next;
-    }
+    cond_list_destroy(list);
 }
 
 #[no_mangle]
@@ -698,6 +689,17 @@ pub unsafe extern "C" fn sepol_db_to_file(db: *mut policydb, path: *const c_char
     let mut data: *mut c_char = ptr::null_mut();
     let mut size: usize = 0;
 
+    struct BufState {
+        data: Vec<u8>,
+    }
+
+    unsafe extern "C" fn buf_write(cookie: *mut c_void, buf: *const c_char, len: c_int) -> c_int {
+        let state = &mut *(cookie as *mut BufState);
+        let slice = slice::from_raw_parts(buf as *const u8, len as usize);
+        state.data.extend_from_slice(slice);
+        len
+    }
+
     // Use open_memstream on Linux, funopen on Android/BSD
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "openbsd"))]
     let (fp, buf_cookie) = {
@@ -712,19 +714,6 @@ pub unsafe extern "C" fn sepol_db_to_file(db: *mut policydb, path: *const c_char
             ) -> *mut libc::FILE;
         }
 
-        struct BufState {
-            data: Vec<u8>,
-        }
-        unsafe extern "C" fn buf_write(
-            cookie: *mut c_void,
-            buf: *const c_char,
-            len: c_int,
-        ) -> c_int {
-            let state = &mut *(cookie as *mut BufState);
-            let slice = slice::from_raw_parts(buf as *const u8, len as usize);
-            state.data.extend_from_slice(slice);
-            len
-        }
         let state = Box::new(BufState { data: Vec::new() });
         let cookie = Box::into_raw(state) as *mut c_void;
         let fp = funopen(cookie, None, Some(buf_write), None, None);
@@ -738,6 +727,9 @@ pub unsafe extern "C" fn sepol_db_to_file(db: *mut policydb, path: *const c_char
     };
 
     if fp.is_null() {
+        if let Some(cookie) = buf_cookie {
+            let _ = Box::from_raw(cookie as *mut BufState);
+        }
         return -1;
     }
 
@@ -751,63 +743,30 @@ pub unsafe extern "C" fn sepol_db_to_file(db: *mut policydb, path: *const c_char
     let ret = policydb_write(db, &mut pf);
     libc::fclose(fp);
 
-    // Retrieve buffer
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "openbsd"))]
-    let (final_data, final_size) = {
-        if let Some(cookie) = buf_cookie {
-            struct BufState { data: Vec<u8> }
-            let state = Box::from_raw(cookie as *mut BufState);
-            let mut v = state.data;
-            let ptr = v.as_mut_ptr() as *mut c_char;
-            let len = v.len();
-            std::mem::forget(v);
-            (ptr, len)
-        } else {
-            (ptr::null_mut(), 0usize)
+    {
+        let Some(cookie) = buf_cookie else {
+            return -1;
+        };
+        let state = Box::from_raw(cookie as *mut BufState);
+        if ret != 0 {
+            return -1;
         }
-    };
+        write_buffer_to_path(path, state.data.as_ptr() as *const c_void, state.data.len())
+    }
 
     #[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "openbsd")))]
-    let (final_data, final_size) = (data, size);
-
-    if ret != 0 {
-        if !final_data.is_null() {
-            libc::free(final_data as *mut c_void);
+    {
+        let result = if ret == 0 {
+            write_buffer_to_path(path, data as *const c_void, size)
+        } else {
+            -1
+        };
+        if !data.is_null() {
+            libc::free(data as *mut c_void);
         }
-        return -1;
+        result
     }
-
-    // Open file for writing
-    let fd = libc::open(
-        path,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
-        0o644i32,
-    );
-    if fd < 0 {
-        if !final_data.is_null() {
-            libc::free(final_data as *mut c_void);
-        }
-        return -1;
-    }
-
-    // Truncate if file already has content
-    let mut st: libc::stat = mem::zeroed();
-    if libc::fstat(fd, &mut st) == 0 && st.st_size > 0 {
-        libc::ftruncate(fd, 0);
-    }
-
-    // Write all at once (required for /sys/fs/selinux/load)
-    let written = libc::write(fd, final_data as *const c_void, final_size);
-    libc::close(fd);
-
-    if !final_data.is_null() {
-        libc::free(final_data as *mut c_void);
-    }
-
-    if written < 0 || written as usize != final_size {
-        return -1;
-    }
-    0
 }
 
 #[no_mangle]
@@ -1550,31 +1509,8 @@ pub unsafe extern "C" fn sepol_add_type(
     }
     (*type_datum).s.value = value;
 
-    // For modular policies, set scope in declared.p_types_scope
-    // avrule_decl_t layout (64-bit):
-    //   offset 0:   uint32_t decl_id
-    //   offset 4:   uint32_t enabled
-    //   offset 8:   *cond_list
-    //   offset 16:  *avrules
-    //   offset 24:  *role_tr_rules
-    //   offset 32:  *role_allow_rules
-    //   offset 40:  *range_tr_rules
-    //   offset 48:  scope_index_t required
-    //               = [ebitmap_t;8](128) + *ebitmap_t(8) + u32(4) + pad(4) = 144 bytes
-    //   offset 192: scope_index_t declared
-    //               declared.scope[SYM_TYPES=3] = offset 192 + 3*16 = 240
-    if !(*db).global.is_null() && !(*(*db).global).branch_list.is_null() {
-        let branch = (*(*db).global).branch_list as *mut u8;
-        // ebitmap_t size = pointer(8) + u32(4) + pad(4) = 16 bytes on 64-bit
-        const EBITMAP_SIZE: usize = 16;
-        const SCOPE_INDEX_SIZE: usize = SYM_NUM * EBITMAP_SIZE + 8 + 4 + 4; // 144
-        // avrule_decl fields before required:
-        // 2*u32 + 5 pointers = 8 + 40 = 48
-        const REQUIRED_OFFSET: usize = 8 + 5 * 8; // 48
-        const DECLARED_OFFSET: usize = REQUIRED_OFFSET + SCOPE_INDEX_SIZE; // 192
-        const P_TYPES_SCOPE_OFFSET: usize = DECLARED_OFFSET + SYM_TYPES * EBITMAP_SIZE; // 240
-        let scope_bitmap = branch.add(P_TYPES_SCOPE_OFFSET) as *mut ebitmap_t;
-        ebitmap_set_bit(scope_bitmap, value - 1, 1);
+    if mark_type_declared(db, value) < 0 {
+        return -1;
     }
 
     // Resize type_attr_map and attr_type_map

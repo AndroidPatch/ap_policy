@@ -1,5 +1,37 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+fn has_reallocarray(build: &cc::Build, out_dir: &Path) -> bool {
+    let src = out_dir.join("reallocarray_probe.c");
+    let obj = out_dir.join("reallocarray_probe.o");
+    let source = r#"
+#include <stddef.h>
+#include <stdlib.h>
+#include <malloc.h>
+
+int main(void) { return reallocarray(NULL, 0, 0) == NULL; }
+"#;
+
+    if fs::write(&src, source).is_err() {
+        return false;
+    }
+
+    let mut cmd = build.get_compiler().to_command();
+    cmd.arg(&src)
+        .arg("-c")
+        .arg("-o")
+        .arg(&obj)
+        .arg("-Werror=implicit-function-declaration")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let ok = matches!(cmd.status(), Ok(status) if status.success());
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&obj);
+    ok
+}
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -27,9 +59,8 @@ fn main() {
             .include(&sepol_cil_include)
             .include(sepol_src.join("src"));
 
-        // Android doesn't have reallocarray, don't define HAVE_REALLOCARRAY
-        // so our compat.c implementation will be used
-        if !is_android {
+        let have_reallocarray = has_reallocarray(&build, &out_dir);
+        if have_reallocarray {
             build.define("HAVE_REALLOCARRAY", None);
         }
 
@@ -121,14 +152,19 @@ fn main() {
             }
         }
 
+        build.file("c/sepol_shim.c");
+
         // Compile
         build.compile("sepol");
 
-        // Compile compatibility functions (reallocarray for Android)
+        // Compile compatibility functions when reallocarray is not available
         let mut compat_build = cc::Build::new();
         compat_build
             .file("c/compat.c")
             .include(&sepol_include);
+        if have_reallocarray {
+            compat_build.define("HAVE_REALLOCARRAY", None);
+        }
         compat_build.compile("compat");
 
         println!("cargo:rustc-link-lib=static=sepol");
@@ -147,6 +183,7 @@ fn main() {
 
     // Tell cargo to invalidate the build when files change
     println!("cargo:rerun-if-changed=c/compat.c");
+    println!("cargo:rerun-if-changed=c/sepol_shim.c");
     println!("cargo:rerun-if-changed=src/sepol.rs");
     println!("cargo:rerun-if-changed=src/sepol_impl.rs");
     println!("cargo:rerun-if-changed=build.rs");

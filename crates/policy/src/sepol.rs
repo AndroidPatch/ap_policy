@@ -680,6 +680,10 @@ extern "C" {
 
     // Conditional functions
     pub fn cond_node_destroy(node: *mut cond_node_t);
+    pub fn cond_list_destroy(list: *mut cond_node_t);
+
+    // Local C helpers for layout-sensitive libsepol fields.
+    pub fn mark_type_declared(db: *mut policydb, value: u32) -> c_int;
 
     // Context functions
     pub fn context_to_string(

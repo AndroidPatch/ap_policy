@@ -92,7 +92,6 @@ pub struct SePolicy {
 }
 
 #[cfg(feature = "sepol_linked")]
-#[cfg(feature = "sepol_linked")]
 impl Drop for SePolicy {
     fn drop(&mut self) {
         unsafe {
@@ -219,15 +218,10 @@ impl SePolicy {
 
     /// Add an allow rule
     pub fn allow(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        // Empty slice = wildcard (pass "" to C layer which treats it as NULL/all)
-        let srcs: &[&str] = if s.is_empty() { &[""] } else { s };
-        let tgts: &[&str] = if t.is_empty() { &[""] } else { t };
-        let clss: &[&str] = if c.is_empty() { &[""] } else { c };
-        let perms: &[&str] = if p.is_empty() { &[""] } else { p };
-        for &src in srcs {
-            for &tgt in tgts {
-                for &cls in clss {
-                    for &perm in perms {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
+                    for &perm in Self::expand_wildcard(p) {
                         self.add_rule(src, tgt, cls, perm, AVTAB_ALLOWED as i32, 0);
                     }
                 }
@@ -237,14 +231,10 @@ impl SePolicy {
 
     /// Add a deny rule
     pub fn deny(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        let srcs: &[&str] = if s.is_empty() { &[""] } else { s };
-        let tgts: &[&str] = if t.is_empty() { &[""] } else { t };
-        let clss: &[&str] = if c.is_empty() { &[""] } else { c };
-        let perms: &[&str] = if p.is_empty() { &[""] } else { p };
-        for &src in srcs {
-            for &tgt in tgts {
-                for &cls in clss {
-                    for &perm in perms {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
+                    for &perm in Self::expand_wildcard(p) {
                         self.add_rule(src, tgt, cls, perm, AVTAB_ALLOWED as i32, 1);
                     }
                 }
@@ -254,10 +244,10 @@ impl SePolicy {
 
     /// Add an auditallow rule
     pub fn auditallow(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
-                    for &perm in p {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
+                    for &perm in Self::expand_wildcard(p) {
                         self.add_rule(src, tgt, cls, perm, AVTAB_AUDITALLOW as i32, 0);
                     }
                 }
@@ -267,10 +257,10 @@ impl SePolicy {
 
     /// Add a dontaudit rule
     pub fn dontaudit(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[&str]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
-                    for &perm in p {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
+                    for &perm in Self::expand_wildcard(p) {
                         self.add_rule(src, tgt, cls, perm, AVTAB_AUDITDENY as i32, 1);
                     }
                 }
@@ -280,9 +270,9 @@ impl SePolicy {
 
     /// Add an allowxperm rule
     pub fn allowxperm(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[Xperm]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
                     for perm in p {
                         self.add_xperm_rule(src, tgt, cls, perm, AVTAB_XPERMS_ALLOWED as i32);
                     }
@@ -293,9 +283,9 @@ impl SePolicy {
 
     /// Add an auditallowxperm rule
     pub fn auditallowxperm(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[Xperm]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
                     for perm in p {
                         self.add_xperm_rule(src, tgt, cls, perm, AVTAB_XPERMS_AUDITALLOW as i32);
                     }
@@ -306,9 +296,9 @@ impl SePolicy {
 
     /// Add a dontauditxperm rule
     pub fn dontauditxperm(&mut self, s: &[&str], t: &[&str], c: &[&str], p: &[Xperm]) {
-        for &src in s {
-            for &tgt in t {
-                for &cls in c {
+        for &src in Self::expand_wildcard(s) {
+            for &tgt in Self::expand_wildcard(t) {
+                for &cls in Self::expand_wildcard(c) {
                     for perm in p {
                         self.add_xperm_rule(src, tgt, cls, perm, AVTAB_XPERMS_DONTAUDIT as i32);
                     }
@@ -319,14 +309,14 @@ impl SePolicy {
 
     /// Make types permissive
     pub fn permissive(&mut self, types: &[&str]) {
-        for &t in types {
+        for &t in Self::expand_wildcard(types) {
             self.set_type_state(t, true);
         }
     }
 
     /// Make types enforcing
     pub fn enforce(&mut self, types: &[&str]) {
-        for &t in types {
+        for &t in Self::expand_wildcard(types) {
             self.set_type_state(t, false);
         }
     }
@@ -524,5 +514,13 @@ impl SePolicy {
 
         #[cfg(feature = "sepol_stub")]
         self.inner.add_typeattribute(type_name, attr_name);
+    }
+
+    fn expand_wildcard<'a>(items: &'a [&'a str]) -> &'a [&'a str] {
+        if items.is_empty() {
+            &[""]
+        } else {
+            items
+        }
     }
 }

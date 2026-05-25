@@ -172,20 +172,39 @@ fn parse_sterm<'a>(tokens: &mut Tokens<'a>) -> ParseResult<'a, Vec<&'a str>> {
     }
 }
 
+fn parse_xperm_hex(s: &str) -> Option<u16> {
+    s.strip_prefix("0x")
+        .and_then(|s| u16::from_str_radix(s, 16).ok())
+}
+
+fn parse_xperm_range(s: &str) -> Option<(u16, u16)> {
+    let (low, high) = s.split_once('-')?;
+    Some((parse_xperm_hex(low)?, parse_xperm_hex(high)?))
+}
+
 fn parse_xperm<'a>(tokens: &mut Tokens<'a>) -> ParseResult<'a, Xperm> {
-    let low = match tokens.next() {
-        Some(Token::HX(low)) => low,
-        _ => return Err(ParseError::General)?,
-    };
-    let high = match tokens.peek() {
-        Some(Token::HP) => {
-            tokens.next();
-            match tokens.next() {
-                Some(Token::HX(high)) => high,
-                _ => return Err(ParseError::General)?,
+    let (low, high) = match tokens.next() {
+        Some(Token::HX(low)) => {
+            let high = match tokens.peek() {
+                Some(Token::HP) => {
+                    tokens.next();
+                    match tokens.next() {
+                        Some(Token::HX(high)) => high,
+                        _ => return Err(ParseError::General)?,
+                    }
+                }
+                _ => low,
+            };
+            (low, high)
+        }
+        Some(Token::ID(s)) => {
+            if let Some((low, high)) = parse_xperm_range(s) {
+                (low, high)
+            } else {
+                return Err(ParseError::General)?;
             }
         }
-        _ => low,
+        _ => return Err(ParseError::General)?,
     };
     Ok(Xperm { low, high, reset: false })
 }
@@ -232,6 +251,13 @@ fn parse_xperms<'a>(tokens: &mut Tokens<'a>) -> ParseResult<'a, Vec<Xperm>> {
                 });
             }
         }
+        Some(Token::ID(s)) => {
+            if let Some((low, high)) = parse_xperm_range(s) {
+                xperms.push(Xperm { low, high, reset });
+            } else {
+                return Err(ParseError::General)?;
+            }
+        }
         _ => return Err(ParseError::General)?,
     }
     Ok(xperms)
@@ -265,6 +291,7 @@ fn extract_token<'a>(s: &'a str, tokens: &mut Vec<Token<'a>>) {
         "type_member" => tokens.push(Token::TM),
         "genfscon" => tokens.push(Token::GF),
         "*" => tokens.push(Token::ST),
+        "-" => tokens.push(Token::HP),
         "" => {}
         _ => {
             if let Some(idx) = s.find('{') {
@@ -282,16 +309,11 @@ fn extract_token<'a>(s: &'a str, tokens: &mut Vec<Token<'a>>) {
                 extract_token(a, tokens);
                 tokens.push(Token::CM);
                 extract_token(&b[1..], tokens);
-            } else if let Some(idx) = s.find('-') {
-                let (a, b) = s.split_at(idx);
-                extract_token(a, tokens);
-                tokens.push(Token::HP);
-                extract_token(&b[1..], tokens);
             } else if let Some(s) = s.strip_prefix('~') {
                 tokens.push(Token::TL);
                 extract_token(s, tokens);
-            } else if let Some(s) = s.strip_prefix("0x") {
-                tokens.push(Token::HX(s.parse().unwrap_or(0)));
+            } else if let Some(n) = parse_xperm_hex(s) {
+                tokens.push(Token::HX(n));
             } else {
                 tokens.push(Token::ID(s));
             }
